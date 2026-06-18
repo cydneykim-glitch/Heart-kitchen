@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Healthy Heart Kitchen</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { -webkit-font-smoothing: antialiased; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import React, { useState } from "https://esm.sh/react@18.2.0";
+import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
+import htm from "https://esm.sh/htm@3.1.1";
+
+const html = htm.bind(React.createElement);
+
+/* Design tokens */
+const tokens = {
+  bg: "#F1F5EC",
+  surface: "#FFFFFF",
+  ink: "#1E3A32",
+  muted: "#5C6F65",
+  border: "#DCE6D9",
+  accent: "#D9573A",
+  good: "#2F6B49",
+  goodBg: "rgba(47,107,73,0.10)",
+  moderate: "#8A5A12",
+  moderateBg: "rgba(138,90,18,0.12)",
+  limit: "#9B3F26",
+  limitBg: "rgba(155,63,38,0.10)",
+  displayFont: "'Iowan Old Style','Palatino Linotype',Georgia,serif",
+  bodyFont: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+  monoFont: "'SF Mono',Menlo,Consolas,monospace",
+};
+
+const RATING_META = {
+  great: { text: "Great choice", color: tokens.good, bg: tokens.goodBg },
+  moderate: { text: "Enjoy in moderation", color: tokens.moderate, bg: tokens.moderateBg },
+  limit: { text: "Save for special occasions", color: tokens.limit, bg: tokens.limitBg },
+};
+
+/* AI prompts */
+const RECIPE_SYSTEM_PROMPT = `You are a warm, encouraging cooking guide for someone recovering from coronary bypass surgery. Use general American Heart Association style guidance: low sodium, low saturated fat, more fiber, vegetables, whole grains, and lean protein. Suggest simple recipes a home cook could realistically make.
+Reply with ONLY valid JSON and nothing else (no markdown fences, no preamble), in exactly this shape:
+[{"name": string, "time": string (e.g. "25 min"), "description": string (1-2 appetizing, plain-language sentences), "whyHeartHealthy": string (one short, specific sentence), "ingredients": array of short strings, each one shopping-list item with a rough amount (e.g. "1 lb boneless chicken thighs", "2 cups baby spinach")}]
+Suggest exactly 3 recipes.`;
+
+const FAVORITES_SYSTEM_PROMPT = `You are a warm, encouraging cooking guide for someone recovering from coronary bypass surgery. They've named some comfort foods they love but need heart-healthy versions of. Use general American Heart Association style guidance: low sodium, low saturated fat, more fiber, vegetables, whole grains, and lean protein.
+For each favorite food they list, invent ONE heart-healthy recipe that keeps the same comforting spirit and flavor while fitting that guidance (for example, a swap for fried chicken might be oven-baked herb-crusted chicken).
+Reply with ONLY valid JSON and nothing else (no markdown fences, no preamble), in exactly this shape, with one entry per favorite food listed, in the same order they were given:
+[{"originalFood": string (the favorite food this is a remake of), "name": string (the new recipe's name), "time": string (e.g. "30 min"), "description": string (1-2 appetizing, plain-language sentences), "whyHeartHealthy": string (one short, specific sentence comparing it to the original), "ingredients": array of short strings, each one shopping-list item with a rough amount}]`;
+
+/* API helper - calls our serverless function which holds the key */
+function extractJson(rawText) {
+  let cleaned = rawText.trim().replace(/^```json\s*/i, "").replace(/^```\s*/, "").replace(/```$/, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    const objMatch = cleaned.match(/\{[\s\S]*\}/);
+    const arrMatch = cleaned.match(/\[[\s\S]*\]/);
+    let candidate = null;
+    if (objMatch && arrMatch) {
+      candidate = objMatch.index <= arrMatch.index ? objMatch[0] : arrMatch[0];
+    } else {
+      candidate = objMatch ? objMatch[0] : arrMatch ? arrMatch[0] : null;
+    }
+    if (candidate) return JSON.parse(candidate);
+    throw new Error("Unparseable response: " + cleaned.slice(0, 120));
+  }
+}
+
+async function callClaudeRaw(promptText, maxTokens = 1000, retriesLeft = 2) {
+  let response;
+  try {
+    response = await fetch("/.netlify/functions/ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: promptText }],
+      }),
+    });
+  } catch (e) {
+    throw new Error("NETWORK: " + (e && e.message ? e.message : String(e)));
+  }
+  if (response.status === 429 && retriesLeft > 0) {
+    await new Promise((r) => setTimeout(r, 1800));
+    return callClaudeRaw(promptText, maxTokens, retriesLeft - 1);
+  }
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const errBody = await response.json();
+      detail = (errBody && errBody.error && errBody.error.message) || JSON.stringify(errBody).slice(0, 150);
+    } catch (e) {
+      try { detail = (await response.text()).slice(0, 150); } catch (e2) {}
+    }
+    throw new Error("HTTP " + response.status + (detail ? ": " + detail : ""));
+  }
+  let data;
+  try {
+    data = await response.json();
+  } catch (e) {
+    throw new Error("BAD_BODY: " + (e && e.message ? e.message : String(e)));
+  }
+  const textBlock = (data.content || []).find((b) => b.type === "text");
+  if (!textBlock) throw new Error("NO_TEXT_BLOCK: " + JSON.stringify(data).slice(0, 150));
+  return textBlock.text;
+}
+
+async function withRetry(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 1000));
+    return await fn();
+  }
+}
+
+async function lookupFood(food) {
+  const prompt = `Someone recovering from coronary bypass surgery is asking: is "${food}" heart healthy to eat? Answer in exactly 2 short sentences, no more than 45 words total - the way you'd answer in a quick chat, grounded in general American Heart Association guidance around sodium, saturated fat, fiber, and lean protein. No bullet points, no headers, no extra commentary. After your 2 sentences, on a new line by itself, add exactly one tag: [GREAT], [MODERATE], or [LIMIT] reflecting your overall verdict.`;
+  const raw = await callClaudeRaw(prompt, 220);
+  const tagMatch = raw.match(/\[(GREAT|MODERATE|LIMIT)\]/i);
+  const label = tagMatch ? tagMatch[1].toLowerCase() : "moderate";
+  const message = raw.replace(/\[(GREAT|MODERATE|LIMIT)\]/gi, "").trim();
+  return { title: food, label, message };
+}
+function lookupFoodWithRetry(food) { return withRetry(() => lookupFood(food)); }
+
+async function getRecipeIdeas(userText) {
+  const raw = await callClaudeRaw(RECIPE_SYSTEM_PROMPT + "\n\n" + userText);
+  return extractJson(raw);
+}
+function getRecipeIdeasWithRetry(userText) { return withRetry(() => getRecipeIdeas(userText)); }
+
+async function getFavoriteSwaps(favoritesText) {
+  const raw = await callClaudeRaw(FAVORITES_SYSTEM_PROMPT + "\n\nFavorite foods: " + favoritesText);
+  return extractJson(raw);
+}
+function getFavoriteSwapsWithRetry(favoritesText) { return withRetry(() => getFavoriteSwaps(favoritesText)); }
+
+/* Decorative heartbeat line */
+function buildHeartbeatPath(amplitude, segments = 4, width = 300, baseline = 28) {
+  const segWidth = width / segments;
+  let d = "M0," + baseline;
+  for (let i = 0; i < segments; i++) {
+    const x0 = i * segWidth;
+    d += " L" + (x0 + segWidth * 0.34).toFixed(1) + "," + baseline;
+    d += " L" + (x0 + segWidth * 0.42).toFixed(1) + "," + (baseline - amplitude * 0.35).toFixed(1);
+    d += " L" + (x0 + segWidth * 0.48).toFixed(1) + "," + (baseline + amplitude).toFixed(1);
+    d += " L" + (x0 + segWidth * 0.55).toFixed(1) + "," + (baseline - amplitude * 1.5).toFixed(1);
+    d += " L" + (x0 + segWidth * 0.62).toFixed(1) + "," + baseline;
+    d += " L" + (x0 + segWidth).toFixed(1) + "," + baseline;
+  }
+  return d;
+}
+
+/* Inline icons */
+function IconHeart({ size = 24, color = "currentColor", fill = "none", strokeWidth = 2 }) {
+  return html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill=${fill} stroke=${color} stroke-width=${strokeWidth} stroke-linecap="round" stroke-linejoin="round"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.29 1.5 4.04 3 5.5l7 7Z" /></svg>`;
+}
+function IconSearch({ size = 24, color = "currentColor", strokeWidth = 2 }) {
+  return html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="none" stroke=${color} stroke-width=${strokeWidth} stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>`;
+}
+function IconChefHat({ size = 24, color = "currentColor", strokeWidth = 2 }) {
+  return html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="none" stroke=${color} stroke-width=${strokeWidth} stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.87A4 4 0 0 1 7.41 6a5.11 5.11 0 0 1 1.05-1.54 5 5 0 0 1 7.08 0A5.11 5.11 0 0 1 16.59 6 4 4 0 0 1 18 13.87V21H6Z" /><line x1="6" y1="17" x2="18" y2="17" /></svg>`;
+}
+function IconSpinner({ size = 18 }) {
+  return html`<span style=${{ display: "inline-block", width: size, height: size, border: "2.5px solid currentColor", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />`;
+}
+
+/* Small shared pieces */
+function RatingBadge({ label }) {
+  const meta = RATING_META[label] || RATING_META.moderate;
+  return html`
+    <span style=${{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 12px", borderRadius: 999, background: meta.bg, color: meta.color, fontWeight: 600, fontSize: "0.85rem", whiteSpace: "nowrap" }}>
+      <span style=${{ width: 8, height: 8, borderRadius: "50%", background: meta.color, display: "inline-block", flexShrink: 0 }} />
+      ${meta.text}
+    </span>`;
+}
+
+function PrimaryButton({ children, onClick, disabled, icon: Icon, style }) {
+  return html`
+    <button onClick=${onClick} disabled=${disabled}
+      style=${{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, background: disabled ? "#C9D6C2" : tokens.accent, color: "#FFFFFF", border: "none", borderRadius: 14, padding: "14px 20px", fontSize: "1rem", fontWeight: 600, cursor: disabled ? "default" : "pointer", minHeight: 48, fontFamily: tokens.bodyFont, ...style }}>
+      ${Icon ? html`<${Icon} size=${18} />` : null}
+      ${children}
+    </button>`;
+}
+
+function ErrorNote({ children, detail }) {
+  return html`
+    <div style=${{ color: tokens.limit, background: tokens.limitBg, borderRadius: 10, padding: "10px 14px", margin: "12px 0 0" }}>
+      <p style=${{ fontSize: "0.9rem", margin: 0 }}>${children}</p>
+      ${detail ? html`<p style=${{ fontSize: "0.75rem", margin: "6px 0 0", opacity: 0.8, fontFamily: tokens.monoFont, wordBreak: "break-word" }}>${detail}</p>` : null}
+    </div>`;
+}
+
+function Card({ children, style }) {
+  return html`<div style=${{ background: tokens.surface, border: "1px solid " + tokens.border, borderRadius: 18, padding: 18, boxShadow: "0 2px 10px rgba(30,58,50,0.05)", ...style }}>${children}</div>`;
+}
+
+function RecipeCard({ recipe, eyebrow }) {
+  return html`
+    <${Card}>
+      ${eyebrow ? html`<p style=${{ margin: "0 0 4px", fontSize: "0.78rem", fontWeight: 700, color: tokens.accent, textTransform: "uppercase", letterSpacing: "0.03em" }}>${eyebrow}</p>` : null}
+      <div style=${{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+        <h3 style=${{ fontFamily: tokens.displayFont, fontSize: "1.15rem", margin: 0 }}>${recipe.name}</h3>
+        <span style=${{ fontFamily: tokens.monoFont, fontSize: "0.8rem", color: tokens.muted, whiteSpace: "nowrap", paddingTop: 3 }}>${recipe.time}</span>
+      </div>
+      <p style=${{ margin: "10px 0", lineHeight: 1.55, fontSize: "0.95rem" }}>${recipe.description}</p>
+      <p style=${{ margin: "0 0 14px", fontSize: "0.88rem", color: tokens.good, fontWeight: 600 }}>♥ ${recipe.whyHeartHealthy}</p>
+      ${Array.isArray(recipe.ingredients) && recipe.ingredients.length > 0 ? html`
+        <div style=${{ borderTop: "1px solid " + tokens.border, paddingTop: 12 }}>
+          <p style=${{ margin: "0 0 6px", fontSize: "0.78rem", fontWeight: 700, color: tokens.muted, textTransform: "uppercase", letterSpacing: "0.03em" }}>Shopping list</p>
+          <ul style=${{ margin: 0, paddingLeft: 20, fontSize: "0.92rem", lineHeight: 1.65 }}>
+            ${recipe.ingredients.map((ing, idx) => html`<li key=${idx}>${ing}</li>`)}
+          </ul>
+        </div>` : null}
+    <//>`;
+}
+
+/* Main app */
+function HealthyHeartKitchen() {
+  const [activeTab, setActiveTab] = useState("search");
+  const [query, setQuery] = useState("");
+  const [searchItems, setSearchItems] = useState([]);
+
+  const [ingredients, setIngredients] = useState("");
+  const [recipeLoading, setRecipeLoading] = useState(false);
+  const [recipes, setRecipes] = useState(null);
+  const [recipeError, setRecipeError] = useState("");
+  const [recipeErrorDetail, setRecipeErrorDetail] = useState("");
+
+  const [favorites, setFavorites] = useState("");
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
+  const [favoriteSwaps, setFavoriteSwaps] = useState(null);
+  const [favoritesError, setFavoritesError] = useState("");
+  const [favoritesErrorDetail, setFavoritesErrorDetail] = useState("");
+
+  const handleSearch = async () => {
+    const foodTokens = [...new Set(query.split(/[,\n]+/).map((t) => t.trim()).filter(Boolean))];
+    if (!foodTokens.length) return;
+    const items = foodTokens.map((food, idx) => ({
+      id: Date.now() + "-" + idx, food, status: "loading", title: food, label: null, message: "", errorDetail: "",
+    }));
+    setSearchItems(items);
+    for (const item of items) {
+      try {
+        const result = await lookupFoodWithRetry(item.food);
+        setSearchItems((prev) => prev.map((it) => it.id === item.id ? { ...it, status: "done", title: result.title, label: result.label, message: result.message } : it));
+      } catch (e) {
+        setSearchItems((prev) => prev.map((it) => it.id === item.id ? { ...it, status: "error", errorDetail: (e && e.message) ? e.message : String(e) } : it));
+      }
+    }
+  };
+
+  const handleGetRecipes = async () => {
+    if (recipeLoading) return;
+    setRecipeLoading(true); setRecipeError(""); setRecipeErrorDetail(""); setRecipes(null);
+    try {
+      const userText = ingredients.trim() ? "I have these ingredients on hand: " + ingredients.trim() : "Suggest some general heart-healthy options for someone recovering from bypass surgery.";
+      const result = await getRecipeIdeasWithRetry(userText);
+      setRecipes(Array.isArray(result) ? result : []);
+    } catch (e) {
+      setRecipeError("Couldn't load recipe ideas just now. Please try again in a moment.");
+      setRecipeErrorDetail((e && e.message) ? e.message : String(e));
+    } finally {
+      setRecipeLoading(false);
+    }
+  };
+
+  const handleGetFavoriteSwaps = async () => {
+    if (favoritesLoading || !favorites.trim()) return;
+    setFavoritesLoading(true); setFavoritesError(""); setFavoritesErrorDetail(""); setFavoriteSwaps(null);
+    try {
+      const result = await getFavoriteSwapsWithRetry(favorites.trim());
+      setFavoriteSwaps(Array.isArray(result) ? result : []);
+    } catch (e) {
+      setFavoritesError("Couldn't find swaps just now. Please try again in a moment.");
+      setFavoritesErrorDetail((e && e.message) ? e.message : String(e));
+    } finally {
+      setFavoritesLoading(false);
+    }
+  };
+
+  const heartbeatPath = buildHeartbeatPath(8);
+
+  const navTabs = [
+    { id: "search", label: "Check a Food", icon: IconSearch },
+    { id: "recipes", label: "Recipe Ideas", icon: IconChefHat },
+  ];
+
+  return html`
+    <div style=${{ background: tokens.bg, minHeight: "100vh", fontFamily: tokens.bodyFont, color: tokens.ink }}>
+      <style>${`
+        * { box-sizing: border-box; }
+        button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid ${tokens.accent}; outline-offset: 2px; }
+        .heartbeat-path { stroke-dasharray: 24 1200; animation: travel 5.5s linear infinite; }
+        @keyframes travel { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -1224; } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { .heartbeat-path { animation: none; } }
+        textarea, input { font-family: ${tokens.bodyFont}; }
+      `}</style>
+
+      <header style=${{ padding: "20px 20px 12px", maxWidth: 480, margin: "0 auto" }}>
+        <div style=${{ display: "flex", alignItems: "center", gap: 10 }}>
+          <${IconHeart} size=${30} color=${tokens.accent} fill=${tokens.accent} strokeWidth=${1.5} />
+          <div>
+            <h1 style=${{ fontFamily: tokens.displayFont, fontSize: "1.55rem", fontWeight: 700, margin: 0, lineHeight: 1.15 }}>Healthy Heart Kitchen</h1>
+            <p style=${{ margin: 0, fontSize: "0.9rem", color: tokens.muted }}>Eating well, one bite at a time</p>
+          </div>
+        </div>
+        <svg viewBox="0 0 300 56" style=${{ width: "100%", height: 46, marginTop: 10 }} aria-hidden="true">
+          <path d=${heartbeatPath} stroke=${tokens.accent} stroke-width=${3} fill="none" stroke-linecap="round" stroke-linejoin="round" class="heartbeat-path" opacity=${0.85} />
+        </svg>
+        <p style=${{ margin: "2px 0 0", fontSize: "0.78rem", color: tokens.muted }}>General AHA-style guidance, not medical advice — confirm specifics with your care team.</p>
+      </header>
+
+      <main style=${{ padding: "4px 20px 110px", maxWidth: 480, margin: "0 auto" }}>
+        ${activeTab === "search" ? html`
+          <section>
+            <${Card}>
+              <label htmlFor="food-query" style=${{ display: "block", fontWeight: 600, marginBottom: 8, fontSize: "1rem" }}>What's on the plate?</label>
+              <div style=${{ display: "flex", gap: 8 }}>
+                <input id="food-query" type="text" value=${query}
+                  onInput=${(e) => setQuery(e.target.value)}
+                  onKeyDown=${(e) => { if (e.key === "Enter") handleSearch(); }}
+                  placeholder="e.g. grilled salmon, fried chicken, kale chips"
+                  style=${{ flex: 1, border: "1px solid " + tokens.border, borderRadius: 12, padding: "12px 14px", fontSize: "1rem", minHeight: 48 }} />
+                <button onClick=${handleSearch} disabled=${!query.trim()} aria-label="Check these foods"
+                  style=${{ background: tokens.accent, border: "none", borderRadius: 12, width: 48, height: 48, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", cursor: query.trim() ? "pointer" : "default", opacity: query.trim() ? 1 : 0.6 }}>
+                  <${IconSearch} size=${20} />
+                </button>
+              </div>
+              <p style=${{ margin: "8px 0 0", fontSize: "0.8rem", color: tokens.muted }}>Separate multiple foods with commas to check them all at once.</p>
+            <//>
+
+            ${searchItems.length > 0 ? html`
+              <div style=${{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+                ${searchItems.map((item) => html`
+                  <${Card} key=${item.id}>
+                    ${item.status === "loading" ? html`
+                      <div style=${{ display: "flex", alignItems: "center", gap: 10, color: tokens.muted }}>
+                        <${IconSpinner} size=${18} />
+                        <span style=${{ fontSize: "0.95rem" }}>Checking ${item.food}…</span>
+                      </div>` : null}
+                    ${item.status === "error" ? html`
+                      <p style=${{ fontWeight: 600, margin: "0 0 4px", fontSize: "1rem" }}>${item.food}</p>
+                      <${ErrorNote} detail=${item.errorDetail}>Couldn't check this one just now. Please try again in a moment.<//>` : null}
+                    ${item.status === "done" ? html`
+                      <div style=${{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                        <h2 style=${{ fontFamily: tokens.displayFont, fontSize: "1.25rem", margin: 0 }}>${item.title}</h2>
+                        <${RatingBadge} label=${item.label} />
+                      </div>
+                      <p style=${{ lineHeight: 1.55, margin: "12px 0 0", fontSize: "0.98rem" }}>${item.message}</p>` : null}
+                  <//>`)}
+              </div>` : null}
+          </section>` : null}
+
+        ${activeTab === "recipes" ? html`
+          <section>
+            <${Card}>
+              <label htmlFor="ingredients" style=${{ display: "block", fontWeight: 600, marginBottom: 8, fontSize: "1rem" }}>What's in the kitchen? (optional)</label>
+              <textarea id="ingredients" value=${ingredients} onInput=${(e) => setIngredients(e.target.value)}
+                placeholder="e.g. chicken breast, spinach, brown rice" rows=${2}
+                style=${{ width: "100%", border: "1px solid " + tokens.border, borderRadius: 12, padding: "12px 14px", fontSize: "1rem", resize: "vertical", marginBottom: 14 }}></textarea>
+              <${PrimaryButton} onClick=${handleGetRecipes} disabled=${recipeLoading} icon=${recipeLoading ? IconSpinner : IconChefHat} style=${{ width: "100%" }}>
+                ${recipeLoading ? "Finding ideas…" : "Get recipe ideas"}
+              <//>
+              ${recipeError ? html`<${ErrorNote} detail=${recipeErrorDetail}>${recipeError}<//>` : null}
+            <//>
+
+            ${recipes && recipes.length > 0 ? html`
+              <div style=${{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+                ${recipes.map((r, i) => html`<${RecipeCard} key=${i} recipe=${r} />`)}
+              </div>` : null}
+
+            <${Card} style=${{ marginTop: 28 }}>
+              <label htmlFor="favorites" style=${{ display: "block", fontWeight: 600, marginBottom: 4, fontSize: "1rem" }}>Got a favorite you miss?</label>
+              <p style=${{ margin: "0 0 10px", fontSize: "0.85rem", color: tokens.muted }}>Name the comfort foods you love and we'll find a heart-healthy way to make them again.</p>
+              <textarea id="favorites" value=${favorites} onInput=${(e) => setFavorites(e.target.value)}
+                placeholder="e.g. fried chicken, lasagna, chocolate cake" rows=${2}
+                style=${{ width: "100%", border: "1px solid " + tokens.border, borderRadius: 12, padding: "12px 14px", fontSize: "1rem", resize: "vertical", marginBottom: 14 }}></textarea>
+              <${PrimaryButton} onClick=${handleGetFavoriteSwaps} disabled=${favoritesLoading || !favorites.trim()} icon=${favoritesLoading ? IconSpinner : IconHeart} style=${{ width: "100%" }}>
+                ${favoritesLoading ? "Finding swaps…" : "Find healthy swaps"}
+              <//>
+              ${favoritesError ? html`<${ErrorNote} detail=${favoritesErrorDetail}>${favoritesError}<//>` : null}
+            <//>
+
+            ${favoriteSwaps && favoriteSwaps.length > 0 ? html`
+              <div style=${{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+                ${favoriteSwaps.map((r, i) => html`<${RecipeCard} key=${i} recipe=${r} eyebrow=${"Swap for " + r.originalFood} />`)}
+              </div>` : null}
+          </section>` : null}
+      </main>
+
+      <nav style=${{ position: "fixed", bottom: 0, left: 0, right: 0, background: tokens.surface, borderTop: "1px solid " + tokens.border, display: "flex", justifyContent: "space-around", padding: "8px 8px calc(8px + env(safe-area-inset-bottom))" }}>
+        ${navTabs.map((tab) => {
+          const isActive = activeTab === tab.id;
+          const Icon = tab.icon;
+          return html`
+            <button key=${tab.id} onClick=${() => setActiveTab(tab.id)}
+              style=${{ background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "6px 10px", minWidth: 76, minHeight: 48, color: isActive ? tokens.accent : tokens.muted, cursor: "pointer" }}
+              aria-current=${isActive ? "page" : undefined}>
+              <${Icon} size=${22} strokeWidth=${isActive ? 2.4 : 2} />
+              <span style=${{ fontSize: "0.75rem", fontWeight: isActive ? 700 : 500 }}>${tab.label}</span>
+              <span style=${{ width: 5, height: 5, borderRadius: "50%", background: isActive ? tokens.accent : "transparent" }} />
+            </button>`;
+        })}
+      </nav>
+    </div>`;
+}
+
+createRoot(document.getElementById("root")).render(html`<${HealthyHeartKitchen} />`);
+</script>
+</body>
+</html>
